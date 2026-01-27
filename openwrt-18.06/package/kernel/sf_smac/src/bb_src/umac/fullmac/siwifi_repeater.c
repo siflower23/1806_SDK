@@ -952,9 +952,9 @@ int repeater_register(struct repeater_info **rp_info, struct net_device *vif_dev
     tmp->arr_len  = max_sta / 2;
     for (i = 0; i < IPTYPE; i++) {
         tmp->ip_head[i]  = kzalloc(tmp->arr_len * sizeof(struct repeater_sta *), GFP_ATOMIC);
-        if (!tmp->ip_head) {
+        if (!tmp->ip_head[i]) {
             ret = -ENOMEM;
-            goto out1;
+            goto out2;
         }
     }
     tmp->mac_head = kzalloc(tmp->arr_len * sizeof(struct repeater_sta *), GFP_ATOMIC);
