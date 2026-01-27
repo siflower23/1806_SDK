@@ -61,6 +61,12 @@ unsigned int sf_dev_ct_limit = 50;
 EXPORT_SYMBOL(sf_dev_ct_limit);
 unsigned long sf_oom_drop_level = 0;
 EXPORT_SYMBOL(sf_oom_drop_level);
+/* Cached memory availability to reduce si_mem_available() calls */
+static unsigned long long sf_cached_free_mem = 0;
+static unsigned long sf_mem_cache_jiffies = 0;
+#define SF_MEM_CACHE_INTERVAL (HZ / 100)  /* Refresh every 10ms */
+/* Hysteresis margin to prevent rapid state oscillation (in KB) */
+#define SF_OOM_HYSTERESIS 200
 static void sgmac_set_rx_mode(struct net_device *ndev);
 
 /* EMAC_Soft_Clkgate[3] */
@@ -1116,34 +1122,73 @@ static int sf_smart_oom_drop(struct sgmac_priv *priv, struct sk_buff **rxskb)
 	int bufsz = priv->ndev->mtu + ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN;
 	u32 offset = 0;
 	__be16 proto;
+	unsigned long current_level = READ_ONCE(sf_oom_drop_level);
 
 	if (skb == NULL)
 		goto oom_accept;
 
 	veth = (struct vlan_ethhdr *)skb->data;
-	// MemAvailable/KB in /proc/meminfo
-	free_mem = si_mem_available() << (PAGE_SHIFT -10);
+
+	/* Cache si_mem_available() to reduce overhead - refresh every 10ms */
+	if (time_after(jiffies, sf_mem_cache_jiffies + SF_MEM_CACHE_INTERVAL) ||
+	    sf_mem_cache_jiffies == 0) {
+		sf_cached_free_mem = si_mem_available() << (PAGE_SHIFT - 10);
+		sf_mem_cache_jiffies = jiffies;
+	}
+	free_mem = sf_cached_free_mem;
+
+	/*
+	 * Determine drop level based on memory thresholds with hysteresis.
+	 * Hysteresis: Once in a state, stay there until memory crosses the
+	 * threshold + hysteresis margin to prevent rapid oscillation.
+	 *
+	 * Thresholds (KB above rx_oom_threshold):
+	 *   < 0           : SF_ALL_DROP (immediate drop)
+	 *   0-1000        : SF_RANDOM_DROP (aggressive random drop)
+	 *   1000-1200     : Hysteresis zone for SF_RANDOM_DROP
+	 *   1200-3000     : No drop (transition zone)
+	 *   3000-4000     : SF_UNRELATE_DROP (drop unrelated protocols)
+	 *   4000-4200     : Hysteresis zone for SF_UNRELATE_DROP
+	 *   > 4200        : No drop (clear all)
+	 */
 	if (free_mem < priv->rx_oom_threshold) {
+		/* Critical memory - drop immediately */
 		if (g_rx_smart_drop_en & 0x8)
 			goto oom_drop;
-	}else if (free_mem < (priv->rx_oom_threshold + 1000)) {
+	} else if (free_mem < (priv->rx_oom_threshold + 1000)) {
+		/* Random drop zone */
 		if (g_rx_smart_drop_en & 0x4)
 			set_bit(SF_RANDOM_DROP, &sf_oom_drop_level);
-	}else if (free_mem < (priv->rx_oom_threshold + 3000)) {
-		if (g_rx_smart_drop_en & 0x2) {
+	} else if (free_mem < (priv->rx_oom_threshold + 1000 + SF_OOM_HYSTERESIS)) {
+		/* Hysteresis zone: stay in random drop if already in it */
+		if (!test_bit(SF_RANDOM_DROP, &current_level)) {
+			/* Not in random drop state, transition to safe zone */
 			clear_bit(SF_RANDOM_DROP, &sf_oom_drop_level);
-			set_bit(SF_HASH_DROP, &sf_oom_drop_level);
+			goto oom_accept;
 		}
+		/* Keep SF_RANDOM_DROP active */
+	} else if (free_mem < (priv->rx_oom_threshold + 3000)) {
+		/* Transition zone - clear aggressive drops, allow packets */
+		clear_bit(SF_RANDOM_DROP, &sf_oom_drop_level);
 		goto oom_accept;
-	}else if (free_mem < (priv->rx_oom_threshold + 4000)) {
+	} else if (free_mem < (priv->rx_oom_threshold + 4000)) {
+		/* Unrelated drop zone */
 		if (g_rx_smart_drop_en & 0x1) {
 			clear_bit(SF_RANDOM_DROP, &sf_oom_drop_level);
-			clear_bit(SF_HASH_DROP, &sf_oom_drop_level);
 			set_bit(SF_UNRELATE_DROP, &sf_oom_drop_level);
 		}
-	}else {
+	} else if (free_mem < (priv->rx_oom_threshold + 4000 + SF_OOM_HYSTERESIS)) {
+		/* Hysteresis zone: stay in unrelated drop if already in it */
+		if (!test_bit(SF_UNRELATE_DROP, &current_level)) {
+			/* Not in unrelated drop state, transition to safe zone */
+			clear_bit(SF_RANDOM_DROP, &sf_oom_drop_level);
+			clear_bit(SF_UNRELATE_DROP, &sf_oom_drop_level);
+			goto oom_accept;
+		}
+		/* Keep SF_UNRELATE_DROP active */
+	} else {
+		/* Plenty of memory - clear all drop levels */
 		clear_bit(SF_RANDOM_DROP, &sf_oom_drop_level);
-		clear_bit(SF_HASH_DROP, &sf_oom_drop_level);
 		clear_bit(SF_UNRELATE_DROP, &sf_oom_drop_level);
 		goto oom_accept;
 	}
@@ -1151,7 +1196,7 @@ static int sf_smart_oom_drop(struct sgmac_priv *priv, struct sk_buff **rxskb)
 	if (likely(eth_type_vlan(veth->h_vlan_proto))) {
 		proto = veth->h_vlan_encapsulated_proto;
 		offset = sizeof(*veth);
-	}else {
+	} else {
 		proto = veth->h_vlan_proto;
 		offset = sizeof(struct ethhdr);
 	}
@@ -1160,30 +1205,48 @@ static int sf_smart_oom_drop(struct sgmac_priv *priv, struct sk_buff **rxskb)
 	case htons(ETH_P_PPP_SES):
 		offset += sizeof(struct pppoe_hdr);
 		proto = *((__be16 *)(skb->data + offset));
-		// pppoe lcp keep alive skb should never drop
+		/* pppoe lcp keep alive skb should never drop */
 		if (proto == htons(PPP_LCP))
 			goto oom_accept;
-		if (proto != htons(PPP_IP) && test_bit(SF_UNRELATE_DROP, &sf_oom_drop_level))
-			goto oom_drop;
+		if (proto != htons(PPP_IP)) {
+			/* Non-IP PPPoE: drop if unrelated drop enabled */
+			if (test_bit(SF_UNRELATE_DROP, &sf_oom_drop_level))
+				goto oom_drop;
+			break;
+		}
+		/* PPP_IP: fall through to IP handling */
+		fallthrough;
 	case htons(ETH_P_IP):
 		iph = (struct iphdr *)(skb->data + offset);
 		switch (iph->protocol) {
 		case IPPROTO_TCP:
 			tcp_hdr = (struct tcphdr *)((u8 *)iph + sizeof(struct iphdr));
+			/* Always accept TCP FIN/RST for connection teardown */
 			if (tcp_hdr->fin || tcp_hdr->rst)
 				goto oom_accept;
-		case IPPROTO_UDP:
-			if (test_bit(SF_RANDOM_DROP, &sf_oom_drop_level)
-					&& priv->rx_head % g_drop_div)
+			/* TCP packets: apply random drop if enabled */
+			if (test_bit(SF_RANDOM_DROP, &sf_oom_drop_level) &&
+			    priv->rx_head % g_drop_div)
 				goto oom_drop;
+			break;
+		case IPPROTO_UDP:
+			/* UDP packets: apply random drop if enabled */
+			if (test_bit(SF_RANDOM_DROP, &sf_oom_drop_level) &&
+			    priv->rx_head % g_drop_div)
+				goto oom_drop;
+			break;
 		default:
+			/* Other IP protocols: drop if unrelated drop enabled */
 			if (test_bit(SF_UNRELATE_DROP, &sf_oom_drop_level))
 				goto oom_drop;
+			break;
 		}
 		break;
 	default:
+		/* Non-IP protocols: drop if unrelated drop enabled */
 		if (test_bit(SF_UNRELATE_DROP, &sf_oom_drop_level))
 			goto oom_drop;
+		break;
 	}
 
 oom_accept:
@@ -1195,7 +1258,7 @@ oom_accept:
 	}
 
 oom_drop:
-	// means all memory run out, just self loop in dma ring
+	/* means all memory run out, just self loop in dma ring */
 	if ((dma_ring_cnt(priv->rx_head, priv->rx_tail, DMA_RX_RING_SZ) < 4)) {
 		g_rx_force_drop_cnt++;
 		return SF_DROP;
