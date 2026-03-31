@@ -135,8 +135,10 @@ static int cmd_attr_create_kthread(struct genl_info *info)
 	if (!rep_skb)
 	  return -ENOMEM;
 
-	if (!info)
+	if (!info) {
+	  nlmsg_free(rep_skb);
 	  return -EINVAL;
+	}
 
 	/* prepare mesage head */
 	reply = genlmsg_put_reply(rep_skb, info, &(g_sfnl->generic_family.family), 0, SF_CMD_GENERIC);
@@ -200,8 +202,10 @@ static int cmd_attr_echo_message(struct genl_info *info)
 	if (!rep_skb)
 	  return -ENOMEM;
 
-	if (!info)
+	if (!info) {
+	  nlmsg_free(rep_skb);
 	  return -EINVAL;
+	}
 
 	/* prepare mesage head */
 	reply = genlmsg_put_reply(rep_skb, info, &(g_sfnl->generic_family.family), 0, SF_CMD_GENERIC);

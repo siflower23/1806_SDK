@@ -265,10 +265,6 @@ int sf_thread_test_send_full(struct sf_test_tool_priv *ptest_priv, struct sf_tes
 	ptest_set = ptest_unit->ptest_set;
 	ptest_unit->tx_thread_end = 0;
 
-//	list_add_tail(&ptest_unit->list_unit, &ptest_priv->pt_pool->test_list_hdr);
-	sf_test_list_config(ptest_unit, ptest_priv, SF_TEST_LIST_ADD);
-	ptest_priv->pt_pool->sf_test_thread_num++;
-	ptest_priv->g_start_test_tx++;
 // init test unit
 
 	ori_pkt_len = sizeof(udp_lan_wan_pkt);
@@ -285,6 +281,11 @@ int sf_thread_test_send_full(struct sf_test_tool_priv *ptest_priv, struct sf_tes
 	if (!ptest_unit->dma_tx_data){
 		goto malloc_error;
 	}
+
+//	list_add_tail(&ptest_unit->list_unit, &ptest_priv->pt_pool->test_list_hdr);
+	sf_test_list_config(ptest_unit, ptest_priv, SF_TEST_LIST_ADD);
+	ptest_priv->pt_pool->sf_test_thread_num++;
+	ptest_priv->g_start_test_tx++;
 
 	memset(ptest_unit->dma_tx_data, 0, (ptest_unit->tx_pkt_len*1024));
 	last_dma_tx_data = p_pkt;
@@ -386,10 +387,6 @@ int sf_thread_test_select_pkt(struct sf_test_tool_priv *ptest_priv,struct sf_tes
 	ptest_set = ptest_unit->ptest_set;
 	ptest_unit->tx_thread_end = 0;
 
-//	list_add_tail(&ptest_unit->list_unit, &ptest_priv->pt_pool->test_list_hdr);
-	sf_test_list_config(ptest_unit, ptest_priv, SF_TEST_LIST_ADD);
-	ptest_priv->pt_pool->sf_test_thread_num++;
-	ptest_priv->g_start_test_tx++;
 // init test unit
 
 	ori_pkt_len = sizeof(ipv6_pkt);
@@ -403,6 +400,11 @@ int sf_thread_test_select_pkt(struct sf_test_tool_priv *ptest_priv,struct sf_tes
 	if (!ptest_unit->dma_tx_data){
 		goto malloc_error;
 	}
+
+//	list_add_tail(&ptest_unit->list_unit, &ptest_priv->pt_pool->test_list_hdr);
+	sf_test_list_config(ptest_unit, ptest_priv, SF_TEST_LIST_ADD);
+	ptest_priv->pt_pool->sf_test_thread_num++;
+	ptest_priv->g_start_test_tx++;
 
 	memset(ptest_unit->dma_tx_data, 0, ptest_unit->tx_pkt_len);
 	memcpy(ptest_unit->dma_tx_data, p_pkt, ptest_unit->tx_pkt_len);
@@ -546,7 +548,7 @@ void sf_thread_pool_start_test(struct sf_test_tool_priv *ptest_priv, u8 test_ind
 					&ptest_unit->dma_tx_data_phy, GFP_KERNEL);
 			if (!ptest_unit->dma_tx_data){
 				printk("dma alloc fail with test index %d thread num %d\n",test_index, ptest_priv->pt_pool->sf_test_thread_num);
-				goto malloc_error;
+				goto dma_alloc_error;
 			}
 		memset(ptest_unit->dma_tx_data, 0, ptest_unit->tx_pkt_len);
 	}else{
@@ -555,7 +557,7 @@ void sf_thread_pool_start_test(struct sf_test_tool_priv *ptest_priv, u8 test_ind
 				&ptest_unit->dma_tx_data_phy, GFP_KERNEL);
 		if (!ptest_unit->dma_tx_data){
 			printk("dma alloc fail with test index %d thread num %d\n",test_index, ptest_priv->pt_pool->sf_test_thread_num);
-			goto malloc_error;
+			goto dma_alloc_error;
 		}
 		memset(ptest_unit->dma_tx_data, 0, ptest_unit->tx_pkt_len);
 
@@ -674,6 +676,11 @@ void sf_thread_pool_start_test(struct sf_test_tool_priv *ptest_priv, u8 test_ind
 	INIT_WORK( (struct work_struct *)ptx_work,  start_work_tx_thread);
 	queue_work(ptest_unit->pmanager_wq, (struct work_struct *)ptx_work);
 	return ;
+
+dma_alloc_error:
+	sf_test_list_config(ptest_unit, ptest_priv, SF_TEST_LIST_DEL);
+	ptest_priv->pt_pool->sf_test_thread_num--;
+	ptest_priv->g_start_test_tx--;
 
 malloc_error:
 
